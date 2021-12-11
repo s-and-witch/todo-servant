@@ -1,15 +1,18 @@
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE  TypeOperators #-}
 {-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE BlockArguments #-}
+{-# LANGUAGE RecordWildCards #-}
 module Main where
 
 import Servant
 import Data.Aeson
 import Network.Wai.Handler.Warp
-import GHC.Generics (Generic)
+import GHC.Generics 
 import Control.Concurrent.STM
 import Control.Concurrent.Async
 import Data.IORef
@@ -17,6 +20,7 @@ import Control.Monad.IO.Class
 import Data.HashMap.Strict as HashMap
 import Control.Concurrent
 import System.Random
+import Control.Monad
 
 
 data Status 
@@ -29,15 +33,21 @@ type StartTask
   =  "task" 
   :> "start" 
   :> ReqBody '[JSON] Int 
-  :> Post '[JSON] Int
+  :> Post '[JSON] ID
 
 type CheckTask
   =  "task"
-  :> "status"
-  :> Capture "id" Int
+  :> "status" 
+  :> Capture "id" ID
   :> Get '[JSON] Status
 
 type Api = StartTask :<|> CheckTask
+
+type ID = Int
+
+type Counter = IORef ID
+
+data Task = Task { taskData :: Int, taskId :: ID }
 
 api :: Proxy Api
 api = Proxy
@@ -56,23 +66,22 @@ main = do
     `race_` 
     run 8081 (app tasksQueue counter tasks)
 
-type ID = Int
-
-type Counter = IORef ID
-
-data Task = Task { taskData :: Int, taskId :: ID }
 
 startTask :: TQueue Task -> Counter -> Int -> Handler Int
 startTask tasksQueue counter taskData = do
-  taskId <- liftIO $ readIORef counter
-  liftIO $ modifyIORef counter (+1)
-  let task = Task{ taskData, taskId }
-  liftIO . atomically $ writeTQueue tasksQueue task
-  pure taskId
+    taskId <- newId
+    let task = Task{ taskData, taskId }
+    liftIO . atomically $ writeTQueue tasksQueue task
+    pure taskId
+  where
+    newId = liftIO do
+      taskId <- readIORef counter
+      modifyIORef counter (+1)
+      pure taskId
 
 checkTask :: TVar (HashMap ID Status) -> Int -> Handler Status
-checkTask tasks id = do
-  status <- liftIO . atomically $ HashMap.lookup id <$> readTVar tasks 
+checkTask tasks taskId = do
+  status <- liftIO . atomically $ HashMap.lookup taskId <$> readTVar tasks 
   case status of
     Nothing -> throwError noTaskError
     Just sta -> pure sta
@@ -81,17 +90,13 @@ checkTask tasks id = do
 
 
 tasksExecutor :: TQueue Task -> TVar (HashMap ID Status) -> IO ()
-tasksExecutor tasksQueue tasks = loop
+tasksExecutor tasksQueue tasks = forever do registryTask >>= startTask
   where
-    loop = do
-      (Task taskData id) <- atomically do
-        task@(Task _ id) <- readTQueue tasksQueue
-        modifyTVar tasks (insert id InProcess)
-        pure task
-
-      forkIO do
-        threadDelay =<< randomRIO (1 * 1000000, 20 * 1000000)
-        atomically do
-          modifyTVar tasks (insert id (Finished (taskData * 2)))
-
-      loop
+    registryTask = atomically do
+      task@(Task _ taskId) <- readTQueue tasksQueue
+      modifyTVar tasks (insert taskId InProcess)
+      pure task
+    startTask Task{..} = forkIO do
+      threadDelay =<< randomRIO (4 * 1000000, 20 * 1000000)
+      atomically do
+        modifyTVar tasks (insert taskId (Finished (taskData * 2)))
